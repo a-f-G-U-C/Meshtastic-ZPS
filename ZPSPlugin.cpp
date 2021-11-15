@@ -34,8 +34,10 @@ uint64_t scanStart = 0;
 static int ble_scan(uint32_t duration, bool passive=true, bool dedup=true);
 
 
+//ZPSPlugin::ZPSPlugin()
+//    : ProtobufPlugin("ZPS", ZPS_PORTNUM, Position_fields), concurrency::OSThread("ZPSPlugin")
 ZPSPlugin::ZPSPlugin()
-    : ProtobufPlugin("ZPS", ZPS_PORTNUM, Position_fields), concurrency::OSThread("ZPSPlugin")
+    : SinglePortPlugin("ZPS", ZPS_PORTNUM), concurrency::OSThread("ZPSPlugin")
 {
     setIntervalFromNow(ZPS_STARTUP_DELAY); // Delay startup by 10 seconds, no need to race :)
 
@@ -51,49 +53,52 @@ ZPSPlugin::ZPSPlugin()
 }
 
 
-bool ZPSPlugin::handleReceivedProtobuf(const MeshPacket &mp, Position *pptr)
+bool ZPSPlugin::handleReceived(const MeshPacket &mp)
 {
-    auto p = *pptr;
+    Position pos = Position_init_default;
 
-    DEBUG_MSG("ZPSPlugin::handleReceivedProtobuf\n");
+    auto &pd = mp.decoded;
+    uint8_t nRecs = pd.payload.size >> 3;
 
-    // Log packet size and list of fields, same as position plugin
-    DEBUG_MSG("ZPS solution from node=%08x l=%d %s%s%s%s%s%s%s%s%s%s%s%s%s%s\n", 
-                getFrom(&mp),
-            	mp.decoded.payload.size,
-                p.latitude_i ? "LAT ":"",
-                p.longitude_i ? "LON ":"",
-                p.altitude ? "MSL ":"",
-                p.altitude_hae ? "HAE ":"",
-                p.alt_geoid_sep ? "GEO ":"",
-                p.PDOP ? "PDOP ":"",
-                p.HDOP ? "HDOP ":"",
-                p.VDOP ? "VDOP ":"",
-                p.sats_in_view ? "SIV ":"",
-                p.fix_quality ? "FXQ ":"",
-                p.fix_type ? "FXT ":"",
-                p.pos_timestamp ? "PTS ":"",
-                p.time ? "TIME ":"",
-                p.battery_level ? "BAT ":"");
+    DEBUG_MSG("handleReceived %s 0x%0x->0x%0x, id=0x%x, port=%d, len=%d, rec=%d\n", 
+                name, mp.from, mp.to, mp.id, pd.portnum, pd.payload.size, nRecs);
+    if (nRecs > ZPS_DATAPKT_MAXITEMS)
+        nRecs = ZPS_DATAPKT_MAXITEMS;
+    memcpy(&netData, pd.payload.bytes, nRecs << 3);
 
-    if (p.time) {
-        struct timeval tv;
-        uint32_t secs = p.time;
-
-        tv.tv_sec = secs;
-        tv.tv_usec = 0;
-
-        perhapsSetRTC(RTCQualityFromNet, &tv);
+    // Currently we are unable to act as a position server, so we're
+    // not interested in broadcasts (this will change later)
+    if (mp.to != nodeDB.getNodeNum()) {
+        // Message is not for us, won't process
+        return false;
     }
 
-    NodeInfo *node = nodeDB.getNode(nodeDB.getNodeNum());
-    if (p.location_source) {
-        
-        // FIXME should be conditional, to ensure we don't overwrite a good GPS fix!
+#ifdef ZPS_EXTRAVERBOSE
+    for (int i=0; i<nRecs; i++) {
+        DEBUG_MSG("ZPS[%d]: %08x" "%08x\n", i, (uint32_t)(netData[i]>>32), (uint32_t)netData[i]);
+    }
+#endif
 
-        DEBUG_MSG("Set lon/lat/dop/pts %d/%d/%d/%d\n", 
-                    p.latitude_i, p.longitude_i, p.PDOP, p.pos_timestamp);
-        nodeDB.updatePosition(node->num, p);
+    if ((netData[0] & 0x800000000000) && (nRecs >= 2)) {
+        // message contains a position
+        pos.PDOP = (netData[0] >> 40) & 0x7f;
+        pos.pos_timestamp = netData[0] & 0xffffffff;
+        // second int64 encodes lat and lon
+        pos.longitude_i = (int32_t) (netData[1] & 0xffffffff);
+        pos.latitude_i = (int32_t) ((netData[1]>>32) & 0xffffffff);
+
+        // FIXME should be conditional, to ensure we don't overwrite a good GPS fix!
+        DEBUG_MSG("ZPS lat/lon/dop/pts %d/%d/%d/%d\n", 
+                    pos.latitude_i, pos.longitude_i, pos.PDOP, pos.pos_timestamp);
+
+        // Some required fields
+        pos.time = getTime();
+        pos.location_source = Position_LocSource_LOCSRC_MANUAL_ENTRY;
+
+        nodeDB.updatePosition(nodeDB.getNodeNum(), pos);
+    } else {
+        // nothing we can do - for now
+        return false;
     }
 
     return false; // Let others look at this message also if they want
@@ -103,7 +108,7 @@ bool ZPSPlugin::handleReceivedProtobuf(const MeshPacket &mp, Position *pptr)
 MeshPacket *ZPSPlugin::allocReply()
 {
     MeshPacket *p = allocDataPacket();
-    p->decoded.payload.size = 8 * (netRecs + 2);  // actually can be only +1 if no GPS data
+    p->decoded.payload.size = (netRecs + 2) << 3;  // actually can be only +1 if no GPS data
 
     DEBUG_MSG("Allocating dataPacket for %d items, %d bytes\n", netRecs, p->decoded.payload.size);
     memcpy(p->decoded.payload.bytes, &netData, p->decoded.payload.size);
@@ -147,8 +152,6 @@ int32_t ZPSPlugin::runOnce()
         // check completion status of any running Wifi scan
         numWifi = WiFi.scanComplete();
 
-        // FIXME will this work correctly if ZERO networks are found? 
-
         if (numWifi >= 0) {
             // scan is complete
             DEBUG_MSG("%d BSS found\n", numWifi);
@@ -190,8 +193,6 @@ int32_t ZPSPlugin::runOnce()
         // completion status checked above (bleResSize >= 0)
         DEBUG_MSG("BLE scan done in %d millis\n", millis() - scanStart);
         scanState = SCAN_BLE_DONE;
-
-        // FIXME will this work correctly if ZERO networks are found? 
 
         if (wantBLE && haveBLE) {
             // old data exists, overwrite it
