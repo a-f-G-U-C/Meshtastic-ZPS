@@ -24,13 +24,10 @@ uint64_t encodeBSS(uint8_t *bssid, uint8_t chan, uint8_t absRSSI);
 uint64_t encodeBLE(uint8_t *addr, uint8_t absRSSI);
 
 
-//class ZPSPlugin : public ProtobufPlugin<Position>, private concurrency::OSThread
 class ZPSPlugin : public SinglePortPlugin, private concurrency::OSThread
 {
     /// The id of the last packet we sent, to allow us to cancel it if we make something fresher
     PacketId prevPacketId = 0;
-
-    const pb_msgdesc_t *fields;
 
     /// We limit our broadcasts to a max rate
     uint32_t lastSend = 0;
