@@ -48,12 +48,10 @@ ZPSPlugin::ZPSPlugin()
     WiFi.disconnect();
     WiFi.scanNetworks(true, true);  // nonblock, showhidden
     scanState = SCAN_BSS_RUN;
-
-    // FIXME some (de)initialization of BLE may be required
 }
 
 
-bool ZPSPlugin::handleReceived(const MeshPacket &mp)
+ProcessMessage ZPSPlugin::handleReceived(const MeshPacket &mp)
 {
     Position pos = Position_init_default;
 
@@ -70,7 +68,7 @@ bool ZPSPlugin::handleReceived(const MeshPacket &mp)
     // not interested in broadcasts (this will change later)
     if (mp.to != nodeDB.getNodeNum()) {
         // Message is not for us, won't process
-        return false;
+        return ProcessMessage::CONTINUE;
     }
 
 #ifdef ZPS_EXTRAVERBOSE
@@ -98,10 +96,10 @@ bool ZPSPlugin::handleReceived(const MeshPacket &mp)
         nodeDB.updatePosition(nodeDB.getNodeNum(), pos);
     } else {
         // nothing we can do - for now
-        return false;
+        return ProcessMessage::CONTINUE;
     }
 
-    return false; // Let others look at this message also if they want
+    return ProcessMessage::CONTINUE; // Let others look at this message also if they want
 }
 
 
@@ -286,11 +284,42 @@ uint64_t encodeBLE(uint8_t *addr, uint8_t absRSSI)
 }
 
 
+/*
+ * Quick and dirty hexlifier of byte arrays up to 32 bytes
+ */
+void _dumpHex(char *label, uint8_t *bytes, uint8_t len)
+{
+    const char hex[] = "0123456789abcdef";  // lower hex
+
+    char obuf[65] = { 0 };
+    char *pbuf = obuf;
+
+    len = min(len, 32);  // only first 32 bytes
+    for (int i = 0; i < len; i++) {
+        *(pbuf++) = hex[(bytes[i]>>4) & 0x0f];
+        *(pbuf++) = hex[bytes[i] & 0x0f];
+    }
+
+    DEBUG_MSG("%s %s\n", label, obuf);
+}
+
+
 /**
  * Event handler
  */
 static int ble_gap_event(struct ble_gap_event *event, void *arg)
 {
+
+    // Adverts matching certain patterns are useless for positioning purposes
+    //  (ephemeral MAC etc), so try excluding them if possible
+    //
+    // FIXME This is very undeveloped right now, there are probably more than
+    //   10 patterns we can test and reject - most Apple devices and more
+    //
+    // FIXME we should search the entire length of the packet (a la memmem()),
+    //   not just at the beginning (memcmp())
+    const uint8_t rejPat[] = { 0x1e, 0xff, 0x06, 0x00, 0x01 };  // one of many
+
     struct ble_hs_adv_fields fields;
     int rc;
     int i = 0;
@@ -309,15 +338,33 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
                 // as far as we know, we're not in the middle of a BLE scan!
                 DEBUG_MSG("Unexpected BLE_GAP_EVENT_DISC!\n");
 
+#ifdef ZPS_EXTRAVERBOSE
+            // Dump the advertisement packet
+            _dumpHex("ADV:", event->disc.data, event->disc.length_data);
+#endif
+            // Reject beacons known to be unreliable (ephemeral etc)
+            if (memcmp(event->disc.data, rejPat, sizeof(rejPat)) == 0) {
+                DEBUG_MSG("(BLE item filtered by pattern)\n");
+                return 0;  // Processing-wise, it's still a success
+            }
+
             //
             // STORE THE RESULTS IN A SORTED LIST
             //
 
-            // !!!FIXME!!! SOME DUPLICATES SURVIVE through filter_duplicates = 1
-            // It should be reasonably inexpensive to filter them at this point
-
             // first, pack each BLE item reading into a 64-bit int
             netBytes = encodeBLE(event->disc.addr.val, abs(event->disc.rssi));
+
+            // SOME DUPLICATES SURVIVE through filter_duplicates = 1, catch them here
+            // FIXME! this is somewhat redundant with the sorting loop further down, 
+            //   but right now we write for clarity not optimization
+            for (i = 0; i < bleCounter; i++) {
+                if ((bleResult[i] & 0xffffffffffff) == (netBytes & 0xffffffffffff)) {
+                    DEBUG_MSG("(BLE duplicate filtered)\n");
+                    return 0;
+                }
+            }
+
 #ifdef ZPS_EXTRAVERBOSE
             // redundant extraverbosity, but I need it for duplicate hunting
             DEBUG_MSG("BL_[%02d]: %08x" "%08x\n", bleCounter, 
